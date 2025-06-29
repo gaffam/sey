@@ -1,0 +1,7 @@
+{
+  "temp": {"min": 25, "max": 37, "weight": 0.4, "reason": "\u00c7eltik tarlasi icin ideal sicaklik"},
+  "humidity": {"threshold": 80, "weight": 0.5, "reason": "Çeltik suyu yüksek risk"},
+  "freq": {"min": 200, "max": 600, "weight": 0.1, "reason": "Anopheles turu frekans araligi"},
+  "image_verified": {"weight": 0.1, "reason": "Goruntu dogrulama basarili"}
+}
+

@@ -1,0 +1,6 @@
+{
+  "temp": {"min": 22, "max": 34, "weight": 0.3, "reason": "Uygun sıcaklık"},
+  "humidity": {"threshold": 60, "weight": 0.3, "reason": "Nem yüksek"},
+  "freq": {"min": 250, "max": 700, "weight": 0.3, "reason": "Uygun kanat frekansı"},
+  "image_verified": {"weight": 0.1, "reason": "Görüntü doğrulandı"}
+}
