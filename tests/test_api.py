@@ -15,7 +15,7 @@ os.environ["API_KEY"] = "testkey"
 from gambusia.api import app
 from gambusia.database import init_db
 
-asyncio.get_event_loop().run_until_complete(init_db())
+asyncio.run(init_db())
 client = TestClient(app)
 
 
@@ -145,9 +145,10 @@ def test_geojson_endpoint():
 
 
 def test_websocket_alert():
-    with client.websocket_connect("/alerts") as ws:
+    with client.websocket_connect("/alerts", headers={"X-API-Key": "testkey"}) as ws:
         payload = {
             "device_id": "ws1",
+            "timestamp": "2026-07-15T10:00:00Z",
             "temp": 30,
             "humidity": 90,
             "freq": 300,
