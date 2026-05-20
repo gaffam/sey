@@ -1,9 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from contextlib import asynccontextmanager
 import asyncio
 import logging
-from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect, Security, HTTPException, Depends
+from fastapi import FastAPI, Form, WebSocket, WebSocketDisconnect, Security, HTTPException, Depends, status
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
 from redis import Redis
@@ -15,32 +15,55 @@ from .config import settings
 from .notifications import (
     send_push_notification,
     send_sms_alert,
-    registered_device_tokens,
 )
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger("gambusia")
-alerts_queue: asyncio.Queue[dict] = asyncio.Queue()
 
 redis: Redis | None = None
 API_KEY = settings.API_KEY
 api_key_header = APIKeyHeader(name="X-API-Key")
 
 
+class AlertBroadcaster:
+    def __init__(self) -> None:
+        self.connections: set[WebSocket] = set()
+
+    async def connect(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.connections.add(websocket)
+
+    def disconnect(self, websocket: WebSocket) -> None:
+        self.connections.discard(websocket)
+
+    async def broadcast(self, message: str) -> None:
+        stale_connections: list[WebSocket] = []
+        for ws in self.connections:
+            try:
+                await ws.send_text(message)
+            except Exception:
+                stale_connections.append(ws)
+        for ws in stale_connections:
+            self.disconnect(ws)
+
+
+alerts = AlertBroadcaster()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global redis
     await init_db()
-    redis = Redis(host="localhost", decode_responses=True)
+    redis = Redis(host=settings.REDIS_HOST, decode_responses=True)
     try:
         yield
     finally:
         if redis is not None:
             try:
                 redis.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Redis close failed: %s", exc)
 
 
 app = FastAPI(
@@ -56,19 +79,14 @@ async def get_api_key(api_key: str = Security(api_key_header)) -> str:
     return api_key
 
 
-@app.post(
-    "/submit",
-    response_model=RiskResponse,
-    summary="Submit a sensor reading",
-    description="""Record a new reading and return the calculated risk score.""",
-)
+@app.post("/submit", response_model=RiskResponse)
 async def submit_data(
     data: SensorData,
     api_key: str = Security(get_api_key),
     session: AsyncSession = Depends(get_db),
 ):
     if data.timestamp is None:
-        data.timestamp = datetime.utcnow()
+        data.timestamp = datetime.now(timezone.utc)
     cfg = "ipsala_risk_config.json" if is_rice_field(data.lat, data.lon) else None
     risk, reasons = calculate_risk(
         data.temp,
@@ -89,15 +107,17 @@ async def submit_data(
         lat=data.lat,
         lon=data.lon,
         extra_sensors=data.extra_sensors,
+        risk_score=risk,
+        pesticide_risk=pesticide_risk,
     )
     session.add(reading)
-    logger.info(
-        "Reading received", extra={"device_id": data.device_id, "risk": risk}
-    )
-    if risk > 0.8:
+    logger.info("Reading received", extra={"device_id": data.device_id, "risk": risk})
+    if risk >= 0.8:
         await send_push_notification(data.device_id, risk)
         await send_sms_alert(data.device_id, risk)
-        alerts_queue.put_nowait({"device_id": data.device_id, "risk_score": risk})
+        await alerts.broadcast(
+            f"ACIL: {data.device_id} noktasinda sivrisinek riski yuksek! skor: {risk}"
+        )
     return RiskResponse(
         risk_score=risk,
         pesticide_risk=pesticide_risk,
@@ -106,12 +126,7 @@ async def submit_data(
     )
 
 
-@app.post(
-    "/submit/sms",
-    response_model=RiskResponse,
-    summary="Submit sensor data via SMS",
-    description="Accept form-encoded sensor data for low-tech devices.",
-)
+@app.post("/submit/sms", response_model=RiskResponse)
 async def submit_via_sms(
     device_id: str = Form(...),
     temp: float = Form(...),
@@ -135,98 +150,70 @@ async def submit_via_sms(
     return await submit_data(data, api_key=api_key, session=session)
 
 
-@app.get(
-    "/map",
-    summary="Retrieve recent readings",
-    description="Return last 100 readings with calculated risk scores.",
-)
-async def map_data(
-    api_key: str = Security(get_api_key),
-    session: AsyncSession = Depends(get_db),
-):
+@app.get("/map")
+async def map_data(api_key: str = Security(get_api_key), session: AsyncSession = Depends(get_db)):
     cached = None
     if redis is not None:
         try:
             cached = redis.get("last_map")
-        except Exception:
-            cached = None
+        except Exception as exc:
+            logger.warning("Redis cache read error: %s", exc)
     if cached:
         return json.loads(cached)
-    result = await session.execute(
-        select(Reading).order_by(Reading.id.desc()).limit(100)
-    )
+    result = await session.execute(select(Reading).order_by(Reading.id.desc()).limit(100))
     rows = result.scalars().all()
-    results = []
-    for r in rows:
-        risk, reasons = calculate_risk(
-            r.temp, r.humidity, r.freq, r.image_verified, timestamp=r.timestamp
-        )
-        pest_risk, _ = calculate_pesticide_risk(r.extra_sensors)
-        results.append(
-            {
-                "device_id": r.device_id,
-                "lat": r.lat,
-                "lon": r.lon,
-                "temp": r.temp,
-                "humidity": r.humidity,
-                "freq": r.freq,
-                "image_verified": r.image_verified,
-                "extra_sensors": r.extra_sensors,
-                "timestamp": r.timestamp.isoformat() if r.timestamp else None,
-                "risk_score": risk,
-                "reasons": reasons,
-                "pesticide_risk": pest_risk,
-            }
-        )
+    results = [
+        {
+            "device_id": r.device_id,
+            "lat": r.lat,
+            "lon": r.lon,
+            "temp": r.temp,
+            "humidity": r.humidity,
+            "freq": r.freq,
+            "image_verified": r.image_verified,
+            "extra_sensors": r.extra_sensors,
+            "timestamp": r.timestamp.isoformat() if r.timestamp else None,
+            "risk_score": r.risk_score,
+            "pesticide_risk": r.pesticide_risk,
+        }
+        for r in rows
+    ]
     if redis is not None:
         try:
             redis.setex("last_map", 60, json.dumps(results))
-        except Exception as e:
-            print(f"Redis cache write error: {e}")
+        except Exception as exc:
+            logger.warning("Redis cache write error: %s", exc)
     return results
 
 
 @app.websocket("/alerts")
 async def alert_notifier(websocket: WebSocket):
-    await websocket.accept()
+    api_key = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
+    if api_key != API_KEY:
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    await alerts.connect(websocket)
     try:
         while True:
-            msg = await alerts_queue.get()
-            await websocket.send_text(
-                f"ACIL: {msg['device_id']} noktasinda sivrisinek riski yuksek! skor: {msg['risk_score']}"
-            )
+            await websocket.receive_text()
     except WebSocketDisconnect:
-        pass
+        alerts.disconnect(websocket)
 
 
-@app.get(
-    "/map/geojson",
-    summary="Retrieve recent readings as GeoJSON",
-    description="Return last 100 readings formatted as GeoJSON FeatureCollection.",
-)
-async def map_geojson(
-    api_key: str = Security(get_api_key),
-    session: AsyncSession = Depends(get_db),
-):
-    result = await session.execute(
-        select(Reading).order_by(Reading.id.desc()).limit(100)
-    )
+@app.get("/map/geojson")
+async def map_geojson(api_key: str = Security(get_api_key), session: AsyncSession = Depends(get_db)):
+    result = await session.execute(select(Reading).order_by(Reading.id.desc()).limit(100))
     rows = result.scalars().all()
-    features = []
-    for r in rows:
-        risk, _ = calculate_risk(
-            r.temp, r.humidity, r.freq, r.image_verified, timestamp=r.timestamp
-        )
-        pest_risk, _ = calculate_pesticide_risk(r.extra_sensors)
-        features.append(
-            {
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [r.lon, r.lat]},
-                "properties": {
-                    "risk_score": risk,
-                    "pesticide_risk": pest_risk,
-                    **(r.extra_sensors or {}),
-                },
-            }
-        )
+    features = [
+        {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [r.lon, r.lat]},
+            "properties": {
+                "risk_score": r.risk_score,
+                "pesticide_risk": r.pesticide_risk,
+                **(r.extra_sensors or {}),
+            },
+        }
+        for r in rows
+    ]
     return JSONResponse({"type": "FeatureCollection", "features": features})

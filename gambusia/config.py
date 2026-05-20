@@ -1,15 +1,17 @@
+import logging
 from pydantic_settings import BaseSettings
 from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger("gambusia")
+
 
 class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8000
     API_KEY: str | None = None
-    DATABASE_URL: str = (
-        "postgresql+asyncpg://postgres:postgres@localhost/gambusia?connect_timeout=5"
-    )
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost/gambusia?connect_timeout=5"
+    REDIS_HOST: str = "localhost"
     TWILIO_SID: str | None = None
     TWILIO_TOKEN: str | None = None
     TWILIO_NUMBER: str | None = None
@@ -19,10 +21,12 @@ class Settings(BaseSettings):
         env_file = ".env"
         env_file_encoding = "utf-8"
 
+
 def get_settings() -> Settings:
     return Settings()
+
 
 settings = get_settings()
 
 if not settings.API_KEY:
-    print("Warning: API_KEY not set")
+    logger.warning("API_KEY not set")
